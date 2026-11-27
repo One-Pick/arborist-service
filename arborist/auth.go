@@ -3,7 +3,6 @@ package arborist
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -12,17 +11,19 @@ import (
 )
 
 type AuthRequestJSON struct {
-	User     AuthRequestJSON_User      `json:"user"`
-	Request  *AuthRequestJSON_Request  `json:"request"`
-	Requests []AuthRequestJSON_Request `json:"requests"`
+	User      AuthRequestJSON_User      `json:"user"`
+	Audiences []string                  `json:"aud"`
+	Request   *AuthRequestJSON_Request  `json:"request"`
+	Requests  []AuthRequestJSON_Request `json:"requests"`
 }
 
 type AuthRequestJSON_User struct {
 	Token  string `json:"token"`
 	UserId string `json:"user_id"`
-	// The Policies field is optional, and if the request provides a token
-	// this gets filled in using the Token field.
-	// Could use UserId if its provided instead of Token
+	// The Policies field is optional. For POST /auth/request, if it is not
+	// provided, it gets filled in using the Token field (or UserId if that is
+	// provided instead of Token). POST /auth/resources ignores this field and
+	// always resolves resources from the caller's own grants.
 	Policies []string `json:"policies,omitempty"`
 	Scopes   []string `json:"scope,omitempty"`
 }
@@ -403,7 +404,7 @@ func authorizeClient(request *AuthRequest) (*AuthResponse, error) {
 	return &AuthResponse{result}, nil
 }
 
-func authRequestFromGET(decode func(string, []string) (*TokenInfo, error), r *http.Request) (*AuthRequest, *ErrorResponse) {
+func authRequestFromGET(decode func(string, []string, []string) (*TokenInfo, error), r *http.Request) (*AuthRequest, *ErrorResponse) {
 	resourcePath := ""
 	resourcePathQS, ok := r.URL.Query()["resource"]
 	if ok {
@@ -428,7 +429,10 @@ func authRequestFromGET(decode func(string, []string) (*TokenInfo, error), r *ht
 	userJWT := strings.TrimPrefix(authHeader, "Bearer ")
 	userJWT = strings.TrimPrefix(userJWT, "bearer ")
 	scopes := []string{"openid"}
-	info, err := decode(userJWT, scopes)
+
+	// NOTE: `GET /auth/proxy` and `GET /auth/resources` do not support a custom token audience
+	// parameter yet. These endpoints assume the token has `aud=gen3`.
+	info, err := decode(userJWT, DefaultExpectedTokenAudiences, scopes)
 	if err != nil {
 		return nil, newErrorResponse(err.Error(), 401, &err)
 	}
@@ -451,53 +455,9 @@ func authRequestFromGET(decode func(string, []string) (*TokenInfo, error), r *ht
 // in the db, this this function will NOT throw an error, but will return only
 // the resources accessible to the `anonymous` and `logged-in` groups.
 //
-// See the FIXME inside. Be careful how this is called, until the implementation is updated.
+// The result is resolved from the caller's own grants - the username, or the
+// client ID - and includes group, `anonymous`, and `logged-in` membership.
 func authorizedResources(db *sqlx.DB, request *AuthRequest) ([]ResourceFromQuery, *ErrorResponse) {
-	// if policies are specified in the request, we can use those (simplest query).
-	if len(request.Policies) > 0 {
-		values := ""
-		for _, policy := range request.Policies {
-			// FIXME (rudyardrichter, 2019-05-09): this could be a SQL
-			// vulnerability if passed arbitrary inputs. As it is this only
-			// gets passed the policies from decoded validated tokens.
-			values += fmt.Sprintf("('%s'), ", policy)
-		}
-		values = strings.TrimRight(values, ", ")
-		selectPolicyWhereName := fmt.Sprintf(
-			"SELECT id FROM policy INNER JOIN (VALUES %s) values(v) ON name = v",
-			values,
-		)
-		stmt := fmt.Sprintf(
-			`
-			SELECT
-				resource.id,
-				resource.name,
-				resource.path,
-				resource.tag,
-				resource.description,
-				array(
-					SELECT child.path
-					FROM resource AS child
-					WHERE child.path ~ (
-						CAST ((ltree2text(resource.path) || '.*{1}') AS lquery)
-					)
-				) AS subresources
-			FROM resource
-			INNER JOIN policy_resource ON resource.id = policy_resource.resource_id
-			INNER JOIN usr_policy ON usr_policy.policy_id = policy_resource.policy_id
-			WHERE (policy_resource.policy_id IN (%s)) AND (
-				usr_policy.expires_at IS NULL OR NOW() < usr_policy.expires_at
-			)
-			`,
-			selectPolicyWhereName,
-		)
-		resources := []ResourceFromQuery{}
-		err := db.Select(&resources, stmt)
-		if err != nil {
-			return nil, newErrorResponse("resources query (using policies) failed", 500, &err)
-		}
-		return resources, nil
-	}
 	resources := []ResourceFromQuery{}
 	if request.ClientID == "" {
 		if request.Username == "" {
