@@ -95,6 +95,7 @@ func roleWithName(db *sqlx.DB, name string) (*RoleFromQuery, error) {
 		SELECT
 			role.id,
 			role.name,
+			role.description,
 			array_remove(array_agg((permission.name, permission.service, permission.method, permission.constraints)), (NULL::text,NULL::text,NULL::text,NULL::jsonb)) AS permissions
 		FROM role
 		LEFT JOIN permission ON permission.role_id = role.id
@@ -115,21 +116,19 @@ func roleWithName(db *sqlx.DB, name string) (*RoleFromQuery, error) {
 }
 
 func rolesWithNames(db *sqlx.DB, roleNames []string) ([]RoleFromQuery, error) {
-	roleNamesString := "'" + strings.Join(roleNames, "','") + "'"
-	stmtFormat := `
+	stmt := `
 		SELECT
 			role.id,
 			role.name,
+			role.description,
 			array_remove(array_agg((permission.name, permission.service, permission.method, permission.constraints)), (NULL::text,NULL::text,NULL::text,NULL::jsonb)) AS permissions
 		FROM role
 		LEFT JOIN permission ON permission.role_id = role.id
-		WHERE role.name IN (%s)
+		WHERE role.name = ANY($1)
 		GROUP BY role.id
 	`
-	stmt := fmt.Sprintf(stmtFormat, roleNamesString)
-
 	roles := []RoleFromQuery{}
-	err := db.Select(&roles, stmt)
+	err := db.Select(&roles, stmt, pq.Array(roleNames))
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +143,7 @@ func listRolesFromDb(db *sqlx.DB) ([]RoleFromQuery, error) {
 		SELECT
 			role.id,
 			role.name,
+			role.description,
 			array_remove(array_agg((permission.name, permission.service, permission.method, permission.constraints)), (NULL::text,NULL::text,NULL::text,NULL::jsonb)) AS permissions
 		FROM role
 		LEFT JOIN permission ON permission.role_id = role.id
@@ -260,6 +260,19 @@ func (role *Role) overwriteInDb(db *sqlx.DB) *ErrorResponse {
 	if err != nil {
 		_ = tx.Rollback()
 		msg := fmt.Sprintf("couldn't overwrite role: %s", err.Error())
+		return newErrorResponse(msg, 500, &err)
+	}
+
+	// PUT replaces the role: permissions no longer in the body are removed (the upstream code kept them, so
+	// a role edit that dropped a permission did not take effect).
+	names := make([]string, 0, len(role.Permissions))
+	for _, permission := range role.Permissions {
+		names = append(names, permission.Name)
+	}
+	_, err = tx.Exec(`DELETE FROM permission WHERE role_id = $1 AND NOT (name = ANY($2))`, roleID, pq.Array(names))
+	if err != nil {
+		_ = tx.Rollback()
+		msg := fmt.Sprintf("couldn't remove old permissions: %s", err.Error())
 		return newErrorResponse(msg, 500, &err)
 	}
 

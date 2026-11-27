@@ -1486,6 +1486,31 @@ func TestServer(t *testing.T) {
 			}
 		})
 
+		t.Run("OverwriteReplacesPermissionsAndKeepsDescription", func(t *testing.T) {
+			put := func(body string) {
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, newRequest("PUT", "/role/replaced", bytes.NewBufferString(body)))
+				if w.Code != http.StatusOK && w.Code != http.StatusCreated {
+					httpError(t, w, "couldn't put role")
+				}
+			}
+			put(`{"id": "replaced", "description": "first", "permissions": [
+				{"id": "a", "action": {"service": "s", "method": "a"}},
+				{"id": "b", "action": {"service": "s", "method": "b"}}]}`)
+			put(`{"id": "replaced", "description": "second", "permissions": [
+				{"id": "b", "action": {"service": "s", "method": "b2"}}]}`)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, newRequest("GET", "/role/replaced", nil))
+			result := arborist.Role{}
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				httpError(t, w, "couldn't read role")
+			}
+			assert.Equal(t, "second", result.Description, w.Body.String())
+			assert.Equal(t, 1, len(result.Permissions), w.Body.String())
+			assert.Equal(t, "b2", result.Permissions[0].Action.Method, w.Body.String())
+			handler.ServeHTTP(httptest.NewRecorder(), newRequest("DELETE", "/role/replaced", nil))
+		})
+
 		t.Run("FailOverwrite", func(t *testing.T) {
 			w := httptest.NewRecorder()
 			body := []byte(`{
@@ -2077,6 +2102,21 @@ func TestServer(t *testing.T) {
 					[]byte(fmt.Sprintf(`{"name": "%s"}`, otherUsername)),
 					http.StatusConflict,
 				)
+			})
+
+			// A database error other than a unique violation on an email-only update (name == nil): upstream
+			// dereferenced the nil name here and panicked. Postgres rejects a NUL byte in text (SQLSTATE 22021),
+			// so the update fails with a server error, and the user is unchanged.
+			t.Run("EmailOnlyDatabaseError", func(t *testing.T) {
+				assert.NotPanics(t, func() {
+					updateUserBytes(
+						t,
+						originalUsername,
+						[]byte(`{"email": "bad\u0000@domain.tld"}`),
+						http.StatusInternalServerError,
+					)
+				})
+				assertUsernameAndEmail(t, originalUsername, "janesmith@domain.tld")
 			})
 		})
 

@@ -31,6 +31,9 @@ type Server struct {
 	jwtApp JWTDecoder
 	logger *LogHandler
 	stmts  *CachedStmts
+	// usersReadOnly: user rows are owned by another service (for example an identity provider writing usr);
+	// POST /user, PATCH and DELETE /user/{name} answer 403 instead of failing in the database.
+	usersReadOnly bool
 }
 
 type RequestPolicy struct {
@@ -45,6 +48,20 @@ func NewServer() *Server {
 func (server *Server) WithLogger(logger *log.Logger) *Server {
 	server.logger = &LogHandler{logger: logger}
 	return server
+}
+
+func (server *Server) WithUsersReadOnly(readOnly bool) *Server {
+	server.usersReadOnly = readOnly
+	return server
+}
+
+// refuseUserWrite answers 403 when user rows are managed elsewhere; true when it did.
+func (server *Server) refuseUserWrite(w http.ResponseWriter, r *http.Request) bool {
+	if !server.usersReadOnly {
+		return false
+	}
+	_ = newErrorResponse("users are managed by the identity service; arborist only grants policies to them", 403, nil).write(w, r)
+	return true
 }
 
 func (server *Server) WithJWTApp(jwtApp JWTDecoder) *Server {
@@ -1295,6 +1312,9 @@ func (server *Server) handleUserList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) handleUserCreate(w http.ResponseWriter, r *http.Request, body []byte) {
+	if server.refuseUserWrite(w, r) {
+		return
+	}
 	user := &User{}
 	err := json.Unmarshal(body, user)
 	if err != nil {
@@ -1341,6 +1361,9 @@ func (server *Server) handleUserRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, body []byte) {
+	if server.refuseUserWrite(w, r) {
+		return
+	}
 	name := mux.Vars(r)["username"]
 	user := User{Name: name}
 
@@ -1373,6 +1396,9 @@ func (server *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, b
 }
 
 func (server *Server) handleUserDelete(w http.ResponseWriter, r *http.Request) {
+	if server.refuseUserWrite(w, r) {
+		return
+	}
 	name := mux.Vars(r)["username"]
 	user := User{Name: name}
 	errResponse := user.deleteInDb(server.db)
