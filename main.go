@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -33,6 +34,16 @@ func main() {
 			"environment variables. If using the commandline argument, add\n"+
 			"?sslmode=disable",
 	)
+	var maxOpenConns *int = flag.Int(
+		"max-db-conns",
+		envInt("ARBORIST_MAX_DB_CONNS", 20),
+		"maximum open database connections (0 = unlimited); env ARBORIST_MAX_DB_CONNS",
+	)
+	var maxIdleConns *int = flag.Int(
+		"max-idle-db-conns",
+		envInt("ARBORIST_MAX_IDLE_DB_CONNS", 5),
+		"maximum idle database connections; env ARBORIST_MAX_IDLE_DB_CONNS",
+	)
 	flag.Parse()
 
 	if *jwkEndpoint == "" {
@@ -45,6 +56,10 @@ func main() {
 		panic(err)
 	}
 	defer db.Close()
+	// database/sql has no limit by default: cap it so replicas stay inside the database's connection budget
+	db.SetMaxOpenConns(*maxOpenConns)
+	db.SetMaxIdleConns(*maxIdleConns)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	logFlags := log.Ldate | log.Ltime
 	logger := log.New(os.Stdout, "", logFlags)
 	jwtApp := authutils.NewJWTApplication(*jwkEndpoint)
@@ -52,6 +67,7 @@ func main() {
 		WithLogger(logger).
 		WithJWTApp(jwtApp).
 		WithDB(db).
+		WithUsersReadOnly(os.Getenv("ARBORIST_USERS_READONLY") == "true").
 		Init()
 	if err != nil {
 		panic(err)
@@ -69,4 +85,12 @@ func main() {
 	}
 	httpLogger.Println("arborist serving at", httpServer.Addr)
 	httpLogger.Fatal(httpServer.ListenAndServe())
+}
+
+// envInt reads an integer environment variable, or returns the default when it is unset or not a number.
+func envInt(name string, fallback int) int {
+	if value, err := strconv.Atoi(os.Getenv(name)); err == nil {
+		return value
+	}
+	return fallback
 }

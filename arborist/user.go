@@ -269,9 +269,14 @@ func (user *User) updateInDb(db *sqlx.DB, name *string, email *string) *ErrorRes
 	`
 	result, err := db.Exec(stmt, name, email, user.Name)
 	if err != nil {
-		// this should only fail because the target name was not unique
-		msg := fmt.Sprintf(`failed to update name to "%s": user with this name already exists`, *name)
-		return newErrorResponse(msg, 409, &err)
+		// a unique violation means the new name is taken; anything else (for example a role without the right
+		// to write usr) is a server error. Upstream dereferenced `name` here, which panicked on email-only updates.
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" && name != nil {
+			msg := fmt.Sprintf(`failed to update name to "%s": user with this name already exists`, *name)
+			return newErrorResponse(msg, 409, &err)
+		}
+		msg := fmt.Sprintf("failed to update user %s: %s", user.Name, err.Error())
+		return newErrorResponse(msg, 500, &err)
 	}
 
 	rowsAffected, _ := result.RowsAffected()
